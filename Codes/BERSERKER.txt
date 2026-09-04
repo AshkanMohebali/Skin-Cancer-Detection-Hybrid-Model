@@ -1,0 +1,209 @@
+# AFTER RECONNECTING
+
+class Berserker(nn.Module):
+    def __init__(self, num_classes):
+        super(Berserker, self).__init__()
+
+        # ResNet50 Backbone
+        resnet = models.resnet50(weights="IMAGENET1K_V1")
+        self.resnet_feat = nn.Sequential(*list(resnet.children())[:-2])  # Remove AvgPool & FC
+
+        # EfficientNetB4 Backbone - Extract features from the penultimate layer
+        efficientnet = create_model('efficientnet_b4', pretrained=True)
+        self.efficientnet_feat = nn.Sequential(*list(efficientnet.children())[:-2])  # Remove classifier (keep features)
+
+        # DenseNet201 Backbone
+        densenet = models.densenet201(weights="IMAGENET1K_V1")
+        self.densenet_feat = densenet.features
+
+        # Swin Transformer Backbone
+        swin = create_model('swin_base_patch4_window7_224', pretrained=True, features_only=True)
+        self.swin_feat = swin
+
+        # Freeze backbone layers to prevent them from training
+        for param in self.resnet_feat.parameters():
+            param.requires_grad = False
+
+        for param in self.efficientnet_feat.parameters():
+            param.requires_grad = False
+
+        for param in self.densenet_feat.parameters():
+            param.requires_grad = False
+
+        for param in self.swin_feat.parameters():
+            param.requires_grad = False
+
+        # Global Average Pooling
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Calculate the total input size dynamically for the fully connected layer
+        fc_input_size = 0
+
+        # Function to calculate the feature size from a model
+        def calculate_fc_input_size(model, dummy_input):
+            with torch.no_grad():
+                output = model(dummy_input)
+                # If the model output is a list, get the first tensor
+                if isinstance(output, list):
+                    output = output[0]
+                output = self.global_pool(output)
+                output = torch.flatten(output, 1)
+                return output.shape[1]
+
+        # Create a dummy input to calculate the feature sizes
+        dummy_input = torch.randn(1, 3, 224, 224)  # Create a dummy input
+
+        # Calculate the input size for each backbone
+        fc_input_size += calculate_fc_input_size(self.resnet_feat, dummy_input)
+        fc_input_size += calculate_fc_input_size(self.efficientnet_feat, dummy_input)
+        fc_input_size += calculate_fc_input_size(self.densenet_feat, dummy_input)
+        fc_input_size += calculate_fc_input_size(self.swin_feat, dummy_input)
+
+        # Calculate the total input size for the fully connected layer
+        fc_input_size = 2048 + 1792 + 1920 + 7  # Corrected fc_input_size based on feature sizes
+
+        # Classification Head
+        self.fc = nn.Sequential(
+            nn.Linear(fc_input_size, 512),  # Use the calculated fc_input_size
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        # Extract features from each backbone
+        resnet_out = self.resnet_feat(x)
+        resnet_out = self.global_pool(resnet_out)
+        resnet_out = torch.flatten(resnet_out, 1)
+
+        efficientnet_out = self.efficientnet_feat(x)
+        efficientnet_out = self.global_pool(efficientnet_out)
+        efficientnet_out = torch.flatten(efficientnet_out, 1)
+
+        densenet_out = self.densenet_feat(x)
+        densenet_out = self.global_pool(densenet_out)
+        densenet_out = torch.flatten(densenet_out, 1)
+
+        # Extract features from Swin Transformer
+        swin_feats = self.swin_feat(x)[-1]  # Get the last feature map (tensor)
+        swin_out = self.global_pool(swin_feats)  # Apply global pooling
+        swin_out = torch.flatten(swin_out, 1)
+
+        # Concatenate all the extracted features
+        combined_features = torch.cat(
+            (resnet_out, efficientnet_out, densenet_out, swin_out), dim=1
+        )
+
+        # Final classification
+        out = self.fc(combined_features)
+        return out
+
+
+# Initialize the Berserker model
+NUM_CLASSES = 7
+model = Berserker(num_classes=NUM_CLASSES)
+
+# Define the optimizer
+optimizer = optim.AdamW(
+    params=[param for param in model.parameters() if param.requires_grad],
+    lr=1e-4,  # You can experiment with this learning rate
+    weight_decay=1e-4
+)
+
+# Define the loss function
+criterion = nn.CrossEntropyLoss()
+
+# Check if there's a saved checkpoint
+checkpoint_path = "/content/drive/MyDrive/best_model.pth"
+start_epoch = 0
+
+if os.path.exists(checkpoint_path):
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch']
+    print(f"Resuming from epoch {start_epoch}")
+
+# Training loop with checkpoint saving
+def train(model, train_loader, val_loader, optimizer, criterion, num_epochs=10, checkpoint_path="best_model.pth", patience=3):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+
+    for epoch in range(start_epoch, num_epochs):  # Start from the last epoch
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+
+        # Training phase
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()  # Reset gradients
+
+            outputs = model(inputs)  # Forward pass
+            loss = criterion(outputs, labels)  # Calculate loss
+            loss.backward()  # Backward pass
+
+            optimizer.step()  # Update weights
+
+            # Track statistics
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+
+        # Compute training accuracy
+        train_accuracy = 100 * train_correct / train_total
+
+        # Validation phase
+        model.eval()  # Set model to evaluation mode (turn off dropout, batch norm, etc.)
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():  # Disable gradient tracking
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+
+                # Track statistics
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+
+        # Compute validation accuracy
+        val_accuracy = 100 * val_correct / val_total
+
+        # Print epoch statistics
+        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Train Accuracy: {train_accuracy:.2f}%")
+        print(f"Epoch [{epoch+1}/{num_epochs}], Val Loss: {val_loss/len(val_loader):.4f}, Val Accuracy: {val_accuracy:.2f}%")
+
+        # Save the model checkpoint if it has the best validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            print(f"Validation loss decreased, saving the model...")
+
+            # Save checkpoint
+            torch.save({
+                'epoch': epoch + 1,  # Save the current epoch
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"Early stopping after {epoch+1} epochs.")
+                break
+
+# Call the training function with your model, data loaders, optimizer, and loss function
+train(model, train_loader, val_loader, optimizer, criterion, num_epochs=10, checkpoint_path=checkpoint_path)
